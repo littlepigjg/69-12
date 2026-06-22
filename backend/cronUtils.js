@@ -140,7 +140,7 @@ function getNextMatch(current, field, direction = 1) {
 }
 
 function getNextCronTime(parsedCron, fromDate = new Date()) {
-  const dt = moment(fromDate).startOf('minute').add(1, 'minute');
+  const dt = moment.utc(fromDate).startOf('minute').add(1, 'minute');
 
   const maxIterations = 366 * 24 * 60;
   let iterations = 0;
@@ -211,25 +211,25 @@ function getNextNCronTimes(parsedCron, n = 5, fromDate = new Date()) {
 }
 
 function isTimeInMaintenanceWindow(parsedCron, durationMinutes, time = new Date()) {
-  const t = moment(time);
+  const t = moment.utc(time);
   const start = findCurrentWindowStart(parsedCron, durationMinutes, t.toDate());
 
   if (!start) return false;
 
-  const end = moment(start).add(durationMinutes, 'minutes');
-  return t >= start && t < end;
+  const end = moment.utc(start).add(durationMinutes, 'minutes');
+  return t.isSameOrAfter(start) && t.isBefore(end);
 }
 
 function findCurrentWindowStart(parsedCron, durationMinutes, time = new Date()) {
-  const t = moment(time);
+  const t = moment.utc(time);
 
   let lastCronTime = null;
-  let searchTime = moment(t).subtract(durationMinutes + 1, 'minutes');
+  let searchTime = moment.utc(t).subtract(7, 'days');
 
   for (let i = 0; i < 100; i++) {
     try {
       const nextCron = getNextCronTime(parsedCron, searchTime.toDate());
-      const nextMoment = moment(nextCron);
+      const nextMoment = moment.utc(nextCron);
 
       if (nextMoment.isAfter(t)) {
         break;
@@ -256,7 +256,7 @@ function getUpcomingMaintenanceWindows(parsedCron, durationMinutes, count = 10, 
   const starts = getNextNCronTimes(parsedCron, count, fromDate);
   return starts.map(start => ({
     start: start,
-    end: moment(start).add(durationMinutes, 'minutes').toDate()
+    end: moment.utc(start).add(durationMinutes, 'minutes').toDate()
   }));
 }
 

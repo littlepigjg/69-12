@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const moment = require('moment');
 const config = require('./config');
-const cronUtils = require('./cronUtils');
+const { init: initMaintenance, maintenance, maintenanceSchedules, maintenanceCombined } = require('./maintenance');
 
 let db = null;
 let SQL = null;
@@ -138,6 +138,35 @@ async function initDB() {
 
   await cleanupOldData();
   saveDB();
+
+  initMaintenance({
+    run: (sql, params = []) => {
+      db.run(sql, params);
+      dirty = true;
+      return { lastID: db.exec('SELECT last_insert_rowid() AS id')[0].values[0][0], changes: null };
+    },
+    query: (sql, params = []) => {
+      const stmt = db.prepare(sql);
+      stmt.bind(params);
+      const results = [];
+      while (stmt.step()) {
+        results.push(stmt.getAsObject());
+      }
+      stmt.free();
+      return results;
+    },
+    queryOne: (sql, params = []) => {
+      const stmt = db.prepare(sql);
+      stmt.bind(params);
+      let result = undefined;
+      if (stmt.step()) {
+        result = stmt.getAsObject();
+      }
+      stmt.free();
+      return result;
+    },
+    saveDB: saveDB
+  });
 }
 
 async function cleanupOldData() {
@@ -240,185 +269,6 @@ const checkResults = {
     query('SELECT * FROM check_results WHERE service_id = ? ORDER BY timestamp DESC LIMIT ?', [serviceId, limit]),
   getByTimeRange: async (serviceId, from, to) =>
     query('SELECT * FROM check_results WHERE service_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC', [serviceId, from, to])
-};
-
-const maintenance = {
-  getAll: async (serviceId = null) => {
-    if (serviceId !== null && serviceId !== undefined) {
-      return query('SELECT * FROM maintenance_windows WHERE service_id = ? ORDER BY start_time DESC', [serviceId]);
-    }
-    return query('SELECT * FROM maintenance_windows ORDER BY start_time DESC');
-  },
-  getActive: async (serviceId, time = new Date().toISOString()) =>
-    query(`SELECT * FROM maintenance_windows WHERE (service_id = ? OR service_id IS NULL)
-           AND active = 1 AND start_time <= ? AND end_time >= ?`, [serviceId, time, time]),
-  create: async (data) => {
-    const payload = { active: 1, description: '', service_id: null, ...data };
-    const res = run(
-      `INSERT INTO maintenance_windows (service_id, name, start_time, end_time, description, active)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [payload.service_id, payload.name, payload.start_time, payload.end_time, payload.description, payload.active]
-    );
-    saveDB();
-    return queryOne('SELECT * FROM maintenance_windows WHERE id = ?', [res.lastID]);
-  },
-  update: async (id, data) => {
-    const keys = Object.keys(data);
-    if (keys.length === 0) return queryOne('SELECT * FROM maintenance_windows WHERE id = ?', [id]);
-    const sets = keys.map(k => `${k} = ?`).join(', ');
-    const values = keys.map(k => data[k]);
-    run(`UPDATE maintenance_windows SET ${sets} WHERE id = ?`, [...values, id]);
-    saveDB();
-    return queryOne('SELECT * FROM maintenance_windows WHERE id = ?', [id]);
-  },
-  remove: async (id) => {
-    run('DELETE FROM maintenance_windows WHERE id = ?', [id]);
-    saveDB();
-    return { changes: 1 };
-  }
-};
-
-const maintenanceSchedules = {
-  getAll: async (serviceId = null) => {
-    if (serviceId !== null && serviceId !== undefined) {
-      return query('SELECT * FROM maintenance_schedules WHERE service_id = ? ORDER BY created_at DESC', [serviceId]);
-    }
-    return query('SELECT * FROM maintenance_schedules ORDER BY created_at DESC');
-  },
-  getById: async (id) => queryOne('SELECT * FROM maintenance_schedules WHERE id = ?', [id]),
-  getActive: async (serviceId = null) => {
-    if (serviceId !== null && serviceId !== undefined) {
-      return query('SELECT * FROM maintenance_schedules WHERE (service_id = ? OR service_id IS NULL) AND active = 1', [serviceId]);
-    }
-    return query('SELECT * FROM maintenance_schedules WHERE active = 1');
-  },
-  create: async (data) => {
-    const payload = { active: 1, description: '', service_id: null, ...data };
-
-    const validation = cronUtils.validateCronExpression(payload.cron_expression);
-    if (!validation.valid) {
-      throw new Error(`Invalid cron expression: ${validation.error}`);
-    }
-
-    if (!payload.duration_minutes || payload.duration_minutes <= 0) {
-      throw new Error('duration_minutes must be a positive integer');
-    }
-
-    const res = run(
-      `INSERT INTO maintenance_schedules (service_id, name, cron_expression, duration_minutes, description, active)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [payload.service_id, payload.name, payload.cron_expression, payload.duration_minutes, payload.description, payload.active]
-    );
-    saveDB();
-    return queryOne('SELECT * FROM maintenance_schedules WHERE id = ?', [res.lastID]);
-  },
-  update: async (id, data) => {
-    const keys = Object.keys(data);
-    if (keys.length === 0) return queryOne('SELECT * FROM maintenance_schedules WHERE id = ?', [id]);
-
-    if (data.cron_expression) {
-      const validation = cronUtils.validateCronExpression(data.cron_expression);
-      if (!validation.valid) {
-        throw new Error(`Invalid cron expression: ${validation.error}`);
-      }
-    }
-
-    if (data.duration_minutes && data.duration_minutes <= 0) {
-      throw new Error('duration_minutes must be a positive integer');
-    }
-
-    const sets = keys.map(k => `${k} = ?`).join(', ');
-    const values = keys.map(k => data[k]);
-    run(`UPDATE maintenance_schedules SET ${sets}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [...values, id]);
-    saveDB();
-    return queryOne('SELECT * FROM maintenance_schedules WHERE id = ?', [id]);
-  },
-  remove: async (id) => {
-    run('DELETE FROM maintenance_schedules WHERE id = ?', [id]);
-    saveDB();
-    return { changes: 1 };
-  },
-  getActiveAtTime: async (serviceId, time = new Date()) => {
-    const activeSchedules = await maintenanceSchedules.getActive(serviceId);
-    const activeWindows = [];
-
-    for (const schedule of activeSchedules) {
-      try {
-        const parsed = cronUtils.parseCronExpression(schedule.cron_expression);
-        if (cronUtils.isTimeInMaintenanceWindow(parsed, schedule.duration_minutes, time)) {
-          const start = cronUtils.findCurrentWindowStart(parsed, time);
-          activeWindows.push({
-            ...schedule,
-            schedule_id: schedule.id,
-            type: 'recurring',
-            window_start: start ? start.toISOString() : null,
-            window_end: start
-              ? require('moment')(start).add(schedule.duration_minutes, 'minutes').toISOString()
-              : null
-          });
-        }
-      } catch (e) {
-        console.error(`[Storage] Error checking schedule #${schedule.id}:`, e.message);
-      }
-    }
-
-    return activeWindows;
-  },
-  getUpcomingWindows: async (serviceId, count = 10, fromDate = new Date()) => {
-    const activeSchedules = await maintenanceSchedules.getActive(serviceId);
-    const allWindows = [];
-
-    for (const schedule of activeSchedules) {
-      try {
-        const parsed = cronUtils.parseCronExpression(schedule.cron_expression);
-        const windows = cronUtils.getUpcomingMaintenanceWindows(parsed, schedule.duration_minutes, count, fromDate);
-        for (const w of windows) {
-          allWindows.push({
-            schedule_id: schedule.id,
-            schedule_name: schedule.name,
-            service_id: schedule.service_id,
-            description: schedule.description,
-            type: 'recurring',
-            start: w.start.toISOString(),
-            end: w.end.toISOString()
-          });
-        }
-      } catch (e) {
-        console.error(`[Storage] Error getting upcoming windows for schedule #${schedule.id}:`, e.message);
-      }
-    }
-
-    allWindows.sort((a, b) => new Date(a.start) - new Date(b.start));
-    return allWindows.slice(0, count);
-  }
-};
-
-const maintenanceCombined = {
-  getActiveAtTime: async (serviceId, time = new Date()) => {
-    const timeIso = time.toISOString ? time.toISOString() : time;
-    const timeDate = time.toISOString ? time : new Date(time);
-
-    const oneTime = await maintenance.getActive(serviceId, timeIso);
-    const recurring = await maintenanceSchedules.getActiveAtTime(serviceId, timeDate);
-
-    const oneTimeWindows = oneTime.map(w => ({
-      ...w,
-      type: 'one_time',
-      schedule_id: null,
-      window_start: w.start_time,
-      window_end: w.end_time
-    }));
-
-    return [...oneTimeWindows, ...recurring];
-  },
-  isInMaintenance: async (serviceId, time = new Date()) => {
-    const active = await maintenanceCombined.getActiveAtTime(serviceId, time);
-    return {
-      inMaintenance: active.length > 0,
-      activeWindows: active,
-      primaryWindow: active.find(w => w.type === 'one_time') || active[0] || null
-    };
-  }
 };
 
 process.on('beforeExit', saveDB);
