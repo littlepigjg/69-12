@@ -55,7 +55,9 @@ function notifyNewCheck(serviceId, result, summary) {
       timestamp: result.timestamp,
       error_message: result.error_message,
       status_code: result.status_code,
-      is_maintenance: result.is_maintenance
+      is_maintenance: result.is_maintenance,
+      maintenance_type: result.maintenance_type,
+      maintenance_schedule_id: result.maintenance_schedule_id
     },
     summary,
     timestamp: new Date().toISOString()

@@ -73,13 +73,16 @@ async function getServiceStatus(serviceId) {
       lastCheck: null,
       response_time_ms: null,
       error_message: null,
-      in_maintenance: false
+      in_maintenance: false,
+      maintenance_type: null,
+      maintenance_info: null
     };
   }
 
   const latestResult = latest[0];
-  const active = await storage.maintenance.getActive(serviceId);
-  const inMaintenance = active.length > 0;
+  const maintResult = await storage.maintenanceCombined.isInMaintenance(serviceId);
+  const inMaintenance = maintResult.inMaintenance;
+  const primaryWindow = maintResult.primaryWindow;
 
   let status;
   if (inMaintenance) {
@@ -96,6 +99,16 @@ async function getServiceStatus(serviceId) {
     response_time_ms: latestResult.response_time_ms,
     error_message: latestResult.error_message,
     in_maintenance: inMaintenance,
+    maintenance_type: primaryWindow ? primaryWindow.type : null,
+    maintenance_info: primaryWindow ? {
+      id: primaryWindow.id,
+      name: primaryWindow.name,
+      description: primaryWindow.description,
+      window_start: primaryWindow.window_start,
+      window_end: primaryWindow.window_end,
+      type: primaryWindow.type,
+      schedule_id: primaryWindow.schedule_id || null
+    } : null,
     status_code: latestResult.status_code
   };
 }

@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const moment = require('moment');
 const config = require('./config');
+const cronUtils = require('./cronUtils');
 
 let db = null;
 let SQL = null;
@@ -72,10 +73,32 @@ async function initDB() {
       response_time_ms INTEGER,
       error_message TEXT,
       status_code INTEGER,
-      is_maintenance INTEGER DEFAULT 0
+      is_maintenance INTEGER DEFAULT 0,
+      maintenance_type TEXT,
+      maintenance_window_id INTEGER,
+      maintenance_schedule_id INTEGER
     )
   `);
   dirty = true;
+
+  try {
+    const cols = db.exec("PRAGMA table_info(check_results)");
+    const colNames = cols[0] ? cols[0].values.map(c => c[1]) : [];
+    if (!colNames.includes('maintenance_type')) {
+      db.run("ALTER TABLE check_results ADD COLUMN maintenance_type TEXT");
+      dirty = true;
+    }
+    if (!colNames.includes('maintenance_window_id')) {
+      db.run("ALTER TABLE check_results ADD COLUMN maintenance_window_id INTEGER");
+      dirty = true;
+    }
+    if (!colNames.includes('maintenance_schedule_id')) {
+      db.run("ALTER TABLE check_results ADD COLUMN maintenance_schedule_id INTEGER");
+      dirty = true;
+    }
+  } catch (e) {
+    console.warn('[Storage] Failed to add maintenance columns to check_results:', e.message);
+  }
 
   db.run(`
     CREATE TABLE IF NOT EXISTS maintenance_windows (
@@ -91,9 +114,25 @@ async function initDB() {
   `);
   dirty = true;
 
+  db.run(`
+    CREATE TABLE IF NOT EXISTS maintenance_schedules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      service_id INTEGER,
+      name TEXT NOT NULL,
+      cron_expression TEXT NOT NULL,
+      duration_minutes INTEGER NOT NULL,
+      description TEXT,
+      active INTEGER DEFAULT 1,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  dirty = true;
+
   try {
     db.exec('CREATE INDEX IF NOT EXISTS idx_results_service_time ON check_results(service_id, timestamp)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_maintenance_time ON maintenance_windows(start_time, end_time)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_maint_sched_active ON maintenance_schedules(active)');
     dirty = true;
   } catch (e) {}
 
@@ -189,9 +228,9 @@ const services = {
 const checkResults = {
   insert: async (result) => {
     const res = run(
-      `INSERT INTO check_results (service_id, timestamp, success, response_time_ms, error_message, status_code, is_maintenance)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [result.service_id, result.timestamp, result.success, result.response_time_ms, result.error_message, result.status_code, result.is_maintenance]
+      `INSERT INTO check_results (service_id, timestamp, success, response_time_ms, error_message, status_code, is_maintenance, maintenance_type, maintenance_window_id, maintenance_schedule_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [result.service_id, result.timestamp, result.success, result.response_time_ms, result.error_message, result.status_code, result.is_maintenance, result.maintenance_type || null, result.maintenance_window_id || null, result.maintenance_schedule_id || null]
     );
     appendLog(result.service_id, result);
     if (process.memoryUsage().heapUsed > 512 * 1024 * 1024) saveDB();
@@ -239,6 +278,149 @@ const maintenance = {
   }
 };
 
+const maintenanceSchedules = {
+  getAll: async (serviceId = null) => {
+    if (serviceId !== null && serviceId !== undefined) {
+      return query('SELECT * FROM maintenance_schedules WHERE service_id = ? ORDER BY created_at DESC', [serviceId]);
+    }
+    return query('SELECT * FROM maintenance_schedules ORDER BY created_at DESC');
+  },
+  getById: async (id) => queryOne('SELECT * FROM maintenance_schedules WHERE id = ?', [id]),
+  getActive: async (serviceId = null) => {
+    if (serviceId !== null && serviceId !== undefined) {
+      return query('SELECT * FROM maintenance_schedules WHERE (service_id = ? OR service_id IS NULL) AND active = 1', [serviceId]);
+    }
+    return query('SELECT * FROM maintenance_schedules WHERE active = 1');
+  },
+  create: async (data) => {
+    const payload = { active: 1, description: '', service_id: null, ...data };
+
+    const validation = cronUtils.validateCronExpression(payload.cron_expression);
+    if (!validation.valid) {
+      throw new Error(`Invalid cron expression: ${validation.error}`);
+    }
+
+    if (!payload.duration_minutes || payload.duration_minutes <= 0) {
+      throw new Error('duration_minutes must be a positive integer');
+    }
+
+    const res = run(
+      `INSERT INTO maintenance_schedules (service_id, name, cron_expression, duration_minutes, description, active)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [payload.service_id, payload.name, payload.cron_expression, payload.duration_minutes, payload.description, payload.active]
+    );
+    saveDB();
+    return queryOne('SELECT * FROM maintenance_schedules WHERE id = ?', [res.lastID]);
+  },
+  update: async (id, data) => {
+    const keys = Object.keys(data);
+    if (keys.length === 0) return queryOne('SELECT * FROM maintenance_schedules WHERE id = ?', [id]);
+
+    if (data.cron_expression) {
+      const validation = cronUtils.validateCronExpression(data.cron_expression);
+      if (!validation.valid) {
+        throw new Error(`Invalid cron expression: ${validation.error}`);
+      }
+    }
+
+    if (data.duration_minutes && data.duration_minutes <= 0) {
+      throw new Error('duration_minutes must be a positive integer');
+    }
+
+    const sets = keys.map(k => `${k} = ?`).join(', ');
+    const values = keys.map(k => data[k]);
+    run(`UPDATE maintenance_schedules SET ${sets}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [...values, id]);
+    saveDB();
+    return queryOne('SELECT * FROM maintenance_schedules WHERE id = ?', [id]);
+  },
+  remove: async (id) => {
+    run('DELETE FROM maintenance_schedules WHERE id = ?', [id]);
+    saveDB();
+    return { changes: 1 };
+  },
+  getActiveAtTime: async (serviceId, time = new Date()) => {
+    const activeSchedules = await maintenanceSchedules.getActive(serviceId);
+    const activeWindows = [];
+
+    for (const schedule of activeSchedules) {
+      try {
+        const parsed = cronUtils.parseCronExpression(schedule.cron_expression);
+        if (cronUtils.isTimeInMaintenanceWindow(parsed, schedule.duration_minutes, time)) {
+          const start = cronUtils.findCurrentWindowStart(parsed, time);
+          activeWindows.push({
+            ...schedule,
+            schedule_id: schedule.id,
+            type: 'recurring',
+            window_start: start ? start.toISOString() : null,
+            window_end: start
+              ? require('moment')(start).add(schedule.duration_minutes, 'minutes').toISOString()
+              : null
+          });
+        }
+      } catch (e) {
+        console.error(`[Storage] Error checking schedule #${schedule.id}:`, e.message);
+      }
+    }
+
+    return activeWindows;
+  },
+  getUpcomingWindows: async (serviceId, count = 10, fromDate = new Date()) => {
+    const activeSchedules = await maintenanceSchedules.getActive(serviceId);
+    const allWindows = [];
+
+    for (const schedule of activeSchedules) {
+      try {
+        const parsed = cronUtils.parseCronExpression(schedule.cron_expression);
+        const windows = cronUtils.getUpcomingMaintenanceWindows(parsed, schedule.duration_minutes, count, fromDate);
+        for (const w of windows) {
+          allWindows.push({
+            schedule_id: schedule.id,
+            schedule_name: schedule.name,
+            service_id: schedule.service_id,
+            description: schedule.description,
+            type: 'recurring',
+            start: w.start.toISOString(),
+            end: w.end.toISOString()
+          });
+        }
+      } catch (e) {
+        console.error(`[Storage] Error getting upcoming windows for schedule #${schedule.id}:`, e.message);
+      }
+    }
+
+    allWindows.sort((a, b) => new Date(a.start) - new Date(b.start));
+    return allWindows.slice(0, count);
+  }
+};
+
+const maintenanceCombined = {
+  getActiveAtTime: async (serviceId, time = new Date()) => {
+    const timeIso = time.toISOString ? time.toISOString() : time;
+    const timeDate = time.toISOString ? time : new Date(time);
+
+    const oneTime = await maintenance.getActive(serviceId, timeIso);
+    const recurring = await maintenanceSchedules.getActiveAtTime(serviceId, timeDate);
+
+    const oneTimeWindows = oneTime.map(w => ({
+      ...w,
+      type: 'one_time',
+      schedule_id: null,
+      window_start: w.start_time,
+      window_end: w.end_time
+    }));
+
+    return [...oneTimeWindows, ...recurring];
+  },
+  isInMaintenance: async (serviceId, time = new Date()) => {
+    const active = await maintenanceCombined.getActiveAtTime(serviceId, time);
+    return {
+      inMaintenance: active.length > 0,
+      activeWindows: active,
+      primaryWindow: active.find(w => w.type === 'one_time') || active[0] || null
+    };
+  }
+};
+
 process.on('beforeExit', saveDB);
 process.on('SIGINT', () => { saveDB(); process.exit(0); });
 process.on('SIGTERM', () => { saveDB(); process.exit(0); });
@@ -248,5 +430,7 @@ module.exports = {
   cleanupOldData,
   services,
   checkResults,
-  maintenance
+  maintenance,
+  maintenanceSchedules,
+  maintenanceCombined
 };

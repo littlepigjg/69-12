@@ -19,11 +19,20 @@ function getInterval(service) {
 
 async function runCheck(service) {
   const timestamp = new Date().toISOString()
+  const now = new Date()
 
   let isMaintenance = false
+  let maintenanceType = null
+  let maintenanceWindowId = null
+  let maintenanceScheduleId = null
   try {
-    const active = await storage.maintenance.getActive(service.id, timestamp)
-    isMaintenance = active.length > 0
+    const maintResult = await storage.maintenanceCombined.isInMaintenance(service.id, now)
+    isMaintenance = maintResult.inMaintenance
+    if (maintResult.primaryWindow) {
+      maintenanceType = maintResult.primaryWindow.type
+      maintenanceWindowId = maintResult.primaryWindow.id
+      maintenanceScheduleId = maintResult.primaryWindow.schedule_id || null
+    }
   } catch (e) {
     console.error(`[Scheduler] Maintenance check error for #${service.id}:`, e.message)
   }
@@ -37,7 +46,10 @@ async function runCheck(service) {
     response_time_ms: rawResult.response_time_ms ?? null,
     error_message: isMaintenance ? null : (rawResult.error_message || null),
     status_code: rawResult.status_code ?? null,
-    is_maintenance: isMaintenance ? 1 : 0
+    is_maintenance: isMaintenance ? 1 : 0,
+    maintenance_type: maintenanceType,
+    maintenance_window_id: maintenanceWindowId,
+    maintenance_schedule_id: maintenanceScheduleId
   }
 
   try {

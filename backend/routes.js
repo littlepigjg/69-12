@@ -4,6 +4,8 @@ const storage = require('./storage');
 const status = require('./status');
 const scheduler = require('./scheduler');
 const notifier = require('./notifier');
+const cronUtils = require('./cronUtils');
+const moment = require('moment');
 
 router.get('/health', (req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
@@ -227,6 +229,196 @@ router.post('/maintenance/quick', async (req, res) => {
     const created = await storage.maintenance.create(data);
     notifier.notifyMaintenanceChange(service_id, created);
     res.status(201).json(created);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/maintenance/schedules', async (req, res) => {
+  try {
+    const schedules = await storage.maintenanceSchedules.getAll();
+    res.json(schedules);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/services/:id/maintenance/schedules', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const svc = await storage.services.getById(id);
+    if (!svc) return res.status(404).json({ error: 'Service not found' });
+    const schedules = await storage.maintenanceSchedules.getAll(id);
+    res.json(schedules);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/maintenance/schedules/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const schedule = await storage.maintenanceSchedules.getById(id);
+    if (!schedule) return res.status(404).json({ error: 'Schedule not found' });
+    res.json(schedule);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/maintenance/schedules', async (req, res) => {
+  try {
+    const data = req.body || {};
+    if (!data.name || !data.cron_expression || !data.duration_minutes) {
+      return res.status(400).json({ error: 'name, cron_expression, duration_minutes are required' });
+    }
+    const created = await storage.maintenanceSchedules.create(data);
+    notifier.notifyMaintenanceChange(data.service_id || null, { ...created, type: 'schedule', changeType: 'created' });
+    res.status(201).json(created);
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.put('/maintenance/schedules/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const existing = await storage.maintenanceSchedules.getById(id);
+    if (!existing) return res.status(404).json({ error: 'Schedule not found' });
+
+    const data = req.body || {};
+    const allowed = ['name', 'cron_expression', 'duration_minutes', 'description', 'active', 'service_id'];
+    const toUpdate = {};
+    for (const key of allowed) {
+      if (key in data) toUpdate[key] = data[key];
+    }
+
+    const updated = await storage.maintenanceSchedules.update(id, toUpdate);
+    notifier.notifyMaintenanceChange(updated.service_id, { ...updated, type: 'schedule', changeType: 'updated' });
+    res.json(updated);
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.delete('/maintenance/schedules/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const existing = await storage.maintenanceSchedules.getById(id);
+    if (!existing) return res.status(404).json({ error: 'Schedule not found' });
+
+    await storage.maintenanceSchedules.remove(id);
+    notifier.notifyMaintenanceChange(existing.service_id, { id, type: 'schedule', deleted: true });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/maintenance/schedules/:id/preview', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const count = Math.min(parseInt(req.query.count, 10) || 5, 20);
+    const schedule = await storage.maintenanceSchedules.getById(id);
+    if (!schedule) return res.status(404).json({ error: 'Schedule not found' });
+
+    const parsed = cronUtils.parseCronExpression(schedule.cron_expression);
+    const upcoming = cronUtils.getUpcomingMaintenanceWindows(parsed, schedule.duration_minutes, count);
+    res.json({
+      scheduleId: id,
+      count: upcoming.length,
+      windows: upcoming.map(w => ({
+        start: w.start.toISOString(),
+        end: w.end.toISOString()
+      }))
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/maintenance/cron/validate', async (req, res) => {
+  try {
+    const expression = req.query.expression || '';
+    const result = cronUtils.validateCronExpression(expression);
+    res.json(result);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/maintenance/cron/preview', async (req, res) => {
+  try {
+    const { expression, duration_minutes = 60, count = 5 } = req.body || {};
+    const expressionQuery = req.query.expression;
+    const cronExpr = expression || expressionQuery;
+
+    if (!cronExpr) {
+      return res.status(400).json({ error: 'expression is required' });
+    }
+
+    const validation = cronUtils.validateCronExpression(cronExpr);
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const parsed = cronUtils.parseCronExpression(cronExpr);
+    const countNum = Math.min(count || 5, 20);
+    const upcoming = cronUtils.getUpcomingMaintenanceWindows(parsed, duration_minutes, countNum);
+    const nextTimes = cronUtils.getNextNCronTimes(parsed, countNum);
+
+    res.json({
+      valid: true,
+      expression: cronExpr,
+      duration_minutes: duration_minutes,
+      next_executions: nextTimes.map(t => t.toISOString()),
+      windows: upcoming.map(w => ({
+        start: w.start.toISOString(),
+        end: w.end.toISOString()
+      }))
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.get('/maintenance/upcoming', async (req, res) => {
+  try {
+    const serviceId = req.query.service_id || null;
+    const count = Math.min(parseInt(req.query.count, 10) || 10, 30);
+
+    const oneTimeWindows = await storage.maintenance.getAll(serviceId);
+    const now = moment();
+
+    const upcomingOneTime = oneTimeWindows
+      .filter(w => w.active && moment(w.end_time) > now)
+      .map(w => ({
+        id: w.id,
+        name: w.name,
+        description: w.description,
+        service_id: w.service_id,
+        type: 'one_time',
+        start: w.start_time,
+        end: w.end_time
+      }));
+
+    const upcomingRecurring = await storage.maintenanceSchedules.getUpcomingWindows(serviceId, count);
+
+    const all = [...upcomingOneTime, ...upcomingRecurring]
+      .sort((a, b) => new Date(a.start) - new Date(b.start))
+      .slice(0, count);
+
+    res.json({ count: all.length, windows: all });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });

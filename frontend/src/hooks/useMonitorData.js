@@ -4,6 +4,7 @@ import useWebSocket from './useWebSocket'
 export default function useMonitorData({ onMessage } = {}) {
   const [services, setServices] = useState([])
   const [maintenance, setMaintenance] = useState([])
+  const [maintenanceSchedules, setMaintenanceSchedules] = useState([])
   const [lastUpdate, setLastUpdate] = useState(null)
   const [loading, setLoading] = useState(true)
 
@@ -35,6 +36,17 @@ export default function useMonitorData({ onMessage } = {}) {
     }
   }, [])
 
+  const fetchMaintenanceSchedules = useCallback(async () => {
+    try {
+      const res = await fetch('/api/maintenance/schedules')
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      setMaintenanceSchedules(data)
+    } catch (e) {
+      console.error('Fetch maintenance schedules error:', e)
+    }
+  }, [])
+
   const ws = useWebSocket('/ws', {
     reconnect: true,
     minReconnectDelay: 1000,
@@ -58,31 +70,36 @@ export default function useMonitorData({ onMessage } = {}) {
         case 'maintenance_change':
           fetchServices()
           fetchMaintenance()
+          fetchMaintenanceSchedules()
           break
         default:
           fetchServices()
       }
     })
     return unsub
-  }, [ws, fetchServices, fetchMaintenance])
+  }, [ws, fetchServices, fetchMaintenance, fetchMaintenanceSchedules])
 
   useEffect(() => {
     fetchServices()
     fetchMaintenance()
+    fetchMaintenanceSchedules()
     const timer = setInterval(() => {
       fetchServices()
       fetchMaintenance()
+      fetchMaintenanceSchedules()
     }, 30000)
     return () => clearInterval(timer)
-  }, [fetchServices, fetchMaintenance])
+  }, [fetchServices, fetchMaintenance, fetchMaintenanceSchedules])
 
   return {
     services,
     maintenance,
+    maintenanceSchedules,
     lastUpdate,
     loading,
     fetchServices,
     fetchMaintenance,
+    fetchMaintenanceSchedules,
     connectionState: ws.connectionState,
     isConnected: ws.isConnected,
     isConnecting: ws.isConnecting,

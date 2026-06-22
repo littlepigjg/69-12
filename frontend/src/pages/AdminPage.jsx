@@ -3,6 +3,7 @@ import { useApp } from '../App.jsx'
 import moment from 'moment'
 import Modal from '../components/Modal.jsx'
 import StatusBadge from '../components/StatusBadge.jsx'
+import CronBuilder from '../components/CronBuilder.jsx'
 import {
   FormField, TextInput, SelectInput, CheckboxInput,
   Button, IconButton
@@ -260,6 +261,95 @@ function MaintenanceForm({ initial, services, onSubmit, onCancel }) {
   )
 }
 
+function RecurringMaintenanceForm({ initial, services, onSubmit, onCancel }) {
+  const [form, setForm] = useState({
+    service_id: initial?.service_id ?? '',
+    name: initial?.name || '',
+    description: initial?.description || '',
+    cron_expression: initial?.cron_expression || '0 2 * * 0',
+    duration_minutes: initial?.duration_minutes || 120,
+    active: initial?.active !== undefined ? initial.active : 1
+  })
+  const [errors, setErrors] = useState({})
+
+  const set = (k, v) => {
+    setForm(f => ({ ...f, [k]: v }))
+    if (errors[k]) setErrors(e => { const n = { ...e }; delete n[k]; return n })
+  }
+
+  const validate = () => {
+    const e = {}
+    if (!form.name.trim()) e.name = '请输入维护规则名称'
+    if (!form.cron_expression?.trim()) e.cron_expression = '请配置 Cron 表达式'
+    if (!form.duration_minutes || form.duration_minutes <= 0) e.duration_minutes = '请设置有效时长'
+    setErrors(e)
+    return Object.keys(e).length === 0
+  }
+
+  const submit = async (e) => {
+    e.preventDefault()
+    if (!validate()) return
+    const data = { ...form }
+    data.service_id = data.service_id === '' ? null : parseInt(data.service_id, 10)
+    data.duration_minutes = parseInt(data.duration_minutes, 10)
+    data.active = data.active ? 1 : 0
+    await onSubmit(data)
+  }
+
+  return (
+    <form onSubmit={submit}>
+      <FormField label="规则名称" error={errors.name}>
+        <TextInput
+          value={form.name}
+          onChange={v => set('name', v)}
+          placeholder="如: 每周日凌晨维护"
+        />
+      </FormField>
+
+      <FormField label="应用服务">
+        <SelectInput
+          value={form.service_id === null ? '' : form.service_id}
+          onChange={v => set('service_id', v)}
+          options={[
+            { value: '', label: '全部服务（全局维护）' },
+            ...services.map(s => ({ value: String(s.id), label: s.name }))
+          ]}
+        />
+      </FormField>
+
+      <FormField label="维护说明">
+        <TextInput
+          value={form.description}
+          onChange={v => set('description', v)}
+          placeholder="描述维护的原因和影响"
+        />
+      </FormField>
+
+      <CronBuilder
+        value={form.cron_expression}
+        onChange={v => set('cron_expression', v)}
+        duration={form.duration_minutes}
+        onDurationChange={v => set('duration_minutes', v)}
+      />
+
+      <div style={{ padding: '12px 0' }}>
+        <CheckboxInput
+          checked={!!form.active}
+          onChange={v => set('active', v ? 1 : 0)}
+          label="立即生效"
+        />
+      </div>
+
+      <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 10 }}>
+        <Button onClick={onCancel}>取消</Button>
+        <Button variant="primary" type="submit">
+          {initial ? '保存修改' : '创建维护规则'}
+        </Button>
+      </div>
+    </form>
+  )
+}
+
 function Toast({ message, type }) {
   if (!message) return null
   return (
@@ -286,10 +376,12 @@ function useToast() {
 }
 
 export default function AdminPage() {
-  const { services, fetchServices, maintenance, fetchMaintenance } = useApp()
+  const { services, fetchServices, maintenance, fetchMaintenance, maintenanceSchedules, fetchMaintenanceSchedules } = useApp()
   const [tab, setTab] = useState('services')
+  const [maintSubTab, setMaintSubTab] = useState('one_time')
   const [showServiceForm, setShowServiceForm] = useState(null)
   const [showMaintForm, setShowMaintForm] = useState(null)
+  const [showRecurringMaintForm, setShowRecurringMaintForm] = useState(null)
   const [openMaintenanceMenu, setOpenMaintenanceMenu] = useState(null)
   const { get, post, put, del } = useApi('/api')
   const { toast, show: showToast } = useToast()
@@ -396,6 +488,53 @@ export default function AdminPage() {
     }
   }
 
+  const handleCreateRecurringMaint = async (data) => {
+    try {
+      await post('/maintenance/schedules', data)
+      await fetchMaintenanceSchedules()
+      await fetchServices()
+      setShowRecurringMaintForm(null)
+      showToast('周期性维护规则已创建')
+    } catch (e) {
+      showToast(e.message || '创建失败', 'error')
+    }
+  }
+
+  const handleUpdateRecurringMaint = async (id, data) => {
+    try {
+      await put(`/maintenance/schedules/${id}`, data)
+      await fetchMaintenanceSchedules()
+      await fetchServices()
+      setShowRecurringMaintForm(null)
+      showToast('周期性维护规则已更新')
+    } catch (e) {
+      showToast(e.message || '更新失败', 'error')
+    }
+  }
+
+  const handleDeleteRecurringMaint = async (m) => {
+    if (!window.confirm(`确定删除周期性维护规则「${m.name}」？`)) return
+    try {
+      await del(`/maintenance/schedules/${m.id}`)
+      await fetchMaintenanceSchedules()
+      await fetchServices()
+      showToast('周期性维护规则已删除')
+    } catch (e) {
+      showToast(e.message || '删除失败', 'error')
+    }
+  }
+
+  const handleToggleRecurringMaint = async (m) => {
+    try {
+      await put(`/maintenance/schedules/${m.id}`, { active: m.active ? 0 : 1 })
+      await fetchMaintenanceSchedules()
+      await fetchServices()
+      showToast(m.active ? '已停用规则' : '已启用规则')
+    } catch (e) {
+      showToast(e.message || '操作失败', 'error')
+    }
+  }
+
   const activeMaintenance = useMemo(() => maintenance.filter(m => {
     const now = moment()
     const start = moment(m.start_time)
@@ -422,16 +561,31 @@ export default function AdminPage() {
             管理监控服务端点和维护窗口配置
           </p>
         </div>
-        <Button
-          variant="primary"
-          icon="+"
-          onClick={() => tab === 'services'
-            ? setShowServiceForm({ mode: 'create' })
-            : setShowMaintForm({ mode: 'create' })
-          }
-        >
-          {tab === 'services' ? '添加监控服务' : '创建维护窗口'}
-        </Button>
+        {tab === 'services' ? (
+          <Button
+            variant="primary"
+            icon="+"
+            onClick={() => setShowServiceForm({ mode: 'create' })}
+          >
+            添加监控服务
+          </Button>
+        ) : maintSubTab === 'one_time' ? (
+          <Button
+            variant="primary"
+            icon="+"
+            onClick={() => setShowMaintForm({ mode: 'create' })}
+          >
+            创建单次维护
+          </Button>
+        ) : (
+          <Button
+            variant="primary"
+            icon="+"
+            onClick={() => setShowRecurringMaintForm({ mode: 'create' })}
+          >
+            创建周期规则
+          </Button>
+        )}
       </div>
 
       {activeMaintenance.length > 0 && (
@@ -470,7 +624,7 @@ export default function AdminPage() {
         <TabButton
           active={tab === 'maintenance'}
           label="维护窗口"
-          badge={maintenance.length}
+          badge={maintenance.length + maintenanceSchedules.length}
           onClick={() => setTab('maintenance')}
         />
       </div>
@@ -612,106 +766,235 @@ export default function AdminPage() {
 
       {tab === 'maintenance' && (
         <div>
-          {maintenance.length === 0 && (
-            <EmptyState
-              icon="🕐"
-              title="暂无维护窗口"
-              hint="创建维护窗口以在指定时间段内忽略服务故障"
+          <div style={{
+            display: 'flex',
+            gap: 4,
+            marginBottom: 20,
+            padding: 4,
+            background: '#f3f4f6',
+            borderRadius: 10,
+            width: 'fit-content'
+          }}>
+            <SubTabButton
+              active={maintSubTab === 'one_time'}
+              label="单次维护"
+              badge={maintenance.length}
+              onClick={() => setMaintSubTab('one_time')}
             />
-          )}
-          <div style={{ display: 'grid', gap: 12 }}>
-            {maintenance.map(m => {
-              const now = moment()
-              const start = moment(m.start_time)
-              const end = moment(m.end_time)
-              const isActive = m.active && now >= start && now <= end
-              const isPast = now > end
-              const isFuture = now < start
-              const svc = services.find(s => s.id === m.service_id)
+            <SubTabButton
+              active={maintSubTab === 'recurring'}
+              label="周期性规则"
+              badge={maintenanceSchedules.length}
+              onClick={() => setMaintSubTab('recurring')}
+            />
+          </div>
 
-              const meta = isActive
-                ? { label: '进行中', color: '#10b981', bg: '#d1fae5' }
-                : isFuture
-                  ? { label: '即将开始', color: '#2563eb', bg: '#dbeafe' }
-                  : isPast
-                    ? { label: '已结束', color: '#6b7280', bg: '#f3f4f6' }
+          {maintSubTab === 'one_time' && (
+            <div>
+              {maintenance.length === 0 && (
+                <EmptyState
+                  icon="🕐"
+                  title="暂无单次维护窗口"
+                  hint="创建单次维护窗口以在指定时间段内忽略服务故障"
+                />
+              )}
+              <div style={{ display: 'grid', gap: 12 }}>
+                {maintenance.map(m => {
+                  const now = moment()
+                  const start = moment(m.start_time)
+                  const end = moment(m.end_time)
+                  const isActive = m.active && now >= start && now <= end
+                  const isPast = now > end
+                  const isFuture = now < start
+                  const svc = services.find(s => s.id === m.service_id)
+
+                  const meta = isActive
+                    ? { label: '进行中', color: '#10b981', bg: '#d1fae5' }
+                    : isFuture
+                      ? { label: '即将开始', color: '#2563eb', bg: '#dbeafe' }
+                      : isPast
+                        ? { label: '已结束', color: '#6b7280', bg: '#f3f4f6' }
+                        : { label: '已停用', color: '#9ca3af', bg: '#f3f4f6' }
+
+                  const totalMinutes = Math.round(end.diff(start, 'minutes'))
+
+                  return (
+                    <div
+                      key={m.id}
+                      style={{
+                        background: '#fff', borderRadius: 12, padding: 18,
+                        border: '1px solid #e5e7eb', display: 'grid',
+                        gridTemplateColumns: 'auto 1fr auto', gap: 16,
+                        alignItems: 'center'
+                      }}
+                    >
+                      <div style={{
+                        width: 46, height: 46, borderRadius: 12,
+                        background: `${meta.color}15`,
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        fontSize: 22
+                      }}>⚙</div>
+
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6, flexWrap: 'wrap' }}>
+                          <h3 style={{ fontSize: 15, fontWeight: 600 }}>{m.name}</h3>
+                          <span style={{
+                            padding: '2px 8px', fontSize: 10, borderRadius: 4,
+                            background: '#e0e7ff', color: '#4f46e5', fontWeight: 500
+                          }}>单次</span>
+                          <span style={{
+                            padding: '3px 10px', fontSize: 11, borderRadius: 999,
+                            background: meta.bg, color: meta.color, fontWeight: 600
+                          }}>{meta.label}</span>
+                          {svc && (
+                            <span style={{
+                              padding: '3px 10px', fontSize: 11, borderRadius: 6,
+                              background: '#f3f4f6', color: '#4b5563'
+                            }}>{svc.name}</span>
+                          )}
+                          {!svc && (
+                            <span style={{
+                              padding: '3px 10px', fontSize: 11, borderRadius: 6,
+                              background: '#ede9fe', color: '#6d28d9'
+                            }}>全部服务</span>
+                          )}
+                        </div>
+                        {m.description && (
+                          <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 6 }}>
+                            {m.description}
+                          </div>
+                        )}
+                        <div style={{ fontSize: 12, color: '#4b5563', fontFamily: 'monospace' }}>
+                          🕐 {start.format('YYYY-MM-DD HH:mm')} → {end.format('YYYY-MM-DD HH:mm')}
+                          <span style={{ color: '#9ca3af', marginLeft: 12 }}>
+                            (共 {formatMinutes(totalMinutes)})
+                          </span>
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <IconButton
+                          icon="✎"
+                          color="primary"
+                          title="编辑"
+                          onClick={() => setShowMaintForm({ mode: 'edit', data: m })}
+                        />
+                        <IconButton
+                          icon={m.active ? '⏸' : '▶'}
+                          title={m.active ? '停用' : '启用'}
+                          onClick={() => handleUpdateMaint(m.id, { active: m.active ? 0 : 1 })}
+                        />
+                        <IconButton
+                          icon="✕"
+                          color="danger"
+                          title="删除"
+                          onClick={() => handleDeleteMaint(m)}
+                        />
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {maintSubTab === 'recurring' && (
+            <div>
+              {maintenanceSchedules.length === 0 && (
+                <EmptyState
+                  icon="🔄"
+                  title="暂无周期性维护规则"
+                  hint="创建周期性维护规则，按 cron 表达式自动生成维护时段"
+                />
+              )}
+              <div style={{ display: 'grid', gap: 12 }}>
+                {maintenanceSchedules.map(s => {
+                  const svc = services.find(svc => svc.id === s.service_id)
+                  const isActive = s.active
+
+                  const meta = isActive
+                    ? { label: '已启用', color: '#10b981', bg: '#d1fae5' }
                     : { label: '已停用', color: '#9ca3af', bg: '#f3f4f6' }
 
-              const totalMinutes = Math.round(end.diff(start, 'minutes'))
+                  return (
+                    <div
+                      key={s.id}
+                      style={{
+                        background: '#fff', borderRadius: 12, padding: 18,
+                        border: '1px solid #e5e7eb', display: 'grid',
+                        gridTemplateColumns: 'auto 1fr auto', gap: 16,
+                        alignItems: 'center'
+                      }}
+                    >
+                      <div style={{
+                        width: 46, height: 46, borderRadius: 12,
+                        background: `${meta.color}15`,
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        fontSize: 22
+                      }}>🔄</div>
 
-              return (
-                <div
-                  key={m.id}
-                  style={{
-                    background: '#fff', borderRadius: 12, padding: 18,
-                    border: '1px solid #e5e7eb', display: 'grid',
-                    gridTemplateColumns: 'auto 1fr auto', gap: 16,
-                    alignItems: 'center'
-                  }}
-                >
-                  <div style={{
-                    width: 46, height: 46, borderRadius: 12,
-                    background: `${meta.color}15`,
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    fontSize: 22
-                  }}>⚙</div>
-
-                  <div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6, flexWrap: 'wrap' }}>
-                      <h3 style={{ fontSize: 15, fontWeight: 600 }}>{m.name}</h3>
-                      <span style={{
-                        padding: '3px 10px', fontSize: 11, borderRadius: 999,
-                        background: meta.bg, color: meta.color, fontWeight: 600
-                      }}>{meta.label}</span>
-                      {svc && (
-                        <span style={{
-                          padding: '3px 10px', fontSize: 11, borderRadius: 6,
-                          background: '#f3f4f6', color: '#4b5563'
-                        }}>{svc.name}</span>
-                      )}
-                      {!svc && (
-                        <span style={{
-                          padding: '3px 10px', fontSize: 11, borderRadius: 6,
-                          background: '#ede9fe', color: '#6d28d9'
-                        }}>全部服务</span>
-                      )}
-                    </div>
-                    {m.description && (
-                      <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 6 }}>
-                        {m.description}
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6, flexWrap: 'wrap' }}>
+                          <h3 style={{ fontSize: 15, fontWeight: 600 }}>{s.name}</h3>
+                          <span style={{
+                            padding: '2px 8px', fontSize: 10, borderRadius: 4,
+                            background: '#fef3c7', color: '#92400e', fontWeight: 500
+                          }}>周期性</span>
+                          <span style={{
+                            padding: '3px 10px', fontSize: 11, borderRadius: 999,
+                            background: meta.bg, color: meta.color, fontWeight: 600
+                          }}>{meta.label}</span>
+                          {svc && (
+                            <span style={{
+                              padding: '3px 10px', fontSize: 11, borderRadius: 6,
+                              background: '#f3f4f6', color: '#4b5563'
+                            }}>{svc.name}</span>
+                          )}
+                          {!svc && (
+                            <span style={{
+                              padding: '3px 10px', fontSize: 11, borderRadius: 6,
+                              background: '#ede9fe', color: '#6d28d9'
+                            }}>全部服务</span>
+                          )}
+                        </div>
+                        {s.description && (
+                          <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 6 }}>
+                            {s.description}
+                          </div>
+                        )}
+                        <div style={{ fontSize: 12, color: '#4b5563', fontFamily: 'monospace' }}>
+                          <span style={{ color: '#7c3aed', fontWeight: 600 }}>{s.cron_expression}</span>
+                          <span style={{ color: '#9ca3af', marginLeft: 12 }}>
+                            时长: {formatMinutes(s.duration_minutes)}
+                          </span>
+                        </div>
                       </div>
-                    )}
-                    <div style={{ fontSize: 12, color: '#4b5563', fontFamily: 'monospace' }}>
-                      🕐 {start.format('YYYY-MM-DD HH:mm')} → {end.format('YYYY-MM-DD HH:mm')}
-                      <span style={{ color: '#9ca3af', marginLeft: 12 }}>
-                        (共 {formatMinutes(totalMinutes)})
-                      </span>
-                    </div>
-                  </div>
 
-                  <div style={{ display: 'flex', gap: 6 }}>
-                    <IconButton
-                      icon="✎"
-                      color="primary"
-                      title="编辑"
-                      onClick={() => setShowMaintForm({ mode: 'edit', data: m })}
-                    />
-                    <IconButton
-                      icon={m.active ? '⏸' : '▶'}
-                      title={m.active ? '停用' : '启用'}
-                      onClick={() => handleUpdateMaint(m.id, { active: m.active ? 0 : 1 })}
-                    />
-                    <IconButton
-                      icon="✕"
-                      color="danger"
-                      title="删除"
-                      onClick={() => handleDeleteMaint(m)}
-                    />
-                  </div>
-                </div>
-              )
-            })}
-          </div>
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <IconButton
+                          icon="✎"
+                          color="primary"
+                          title="编辑"
+                          onClick={() => setShowRecurringMaintForm({ mode: 'edit', data: s })}
+                        />
+                        <IconButton
+                          icon={s.active ? '⏸' : '▶'}
+                          title={s.active ? '停用' : '启用'}
+                          onClick={() => handleToggleRecurringMaint(s)}
+                        />
+                        <IconButton
+                          icon="✕"
+                          color="danger"
+                          title="删除"
+                          onClick={() => handleDeleteRecurringMaint(s)}
+                        />
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -735,7 +1018,7 @@ export default function AdminPage() {
 
       {showMaintForm && (
         <Modal
-          title={showMaintForm.mode === 'create' ? '创建维护窗口' : '编辑维护窗口'}
+          title={showMaintForm.mode === 'create' ? '创建单次维护窗口' : '编辑维护窗口'}
           onClose={() => setShowMaintForm(null)}
           width={640}
         >
@@ -747,6 +1030,24 @@ export default function AdminPage() {
               : (data) => handleUpdateMaint(showMaintForm.data.id, data)
             }
             onCancel={() => setShowMaintForm(null)}
+          />
+        </Modal>
+      )}
+
+      {showRecurringMaintForm && (
+        <Modal
+          title={showRecurringMaintForm.mode === 'create' ? '创建周期性维护规则' : '编辑周期性维护规则'}
+          onClose={() => setShowRecurringMaintForm(null)}
+          width={720}
+        >
+          <RecurringMaintenanceForm
+            initial={showRecurringMaintForm.data}
+            services={services}
+            onSubmit={showRecurringMaintForm.mode === 'create'
+              ? handleCreateRecurringMaint
+              : (data) => handleUpdateRecurringMaint(showRecurringMaintForm.data.id, data)
+            }
+            onCancel={() => setShowRecurringMaintForm(null)}
           />
         </Modal>
       )}
@@ -772,6 +1073,33 @@ function TabButton({ active, label, badge, onClick }) {
           marginLeft: 8, padding: '2px 8px',
           background: active ? '#e0e7ff' : '#f3f4f6',
           borderRadius: 999, fontSize: 12
+        }}>{badge}</span>
+      )}
+    </button>
+  )
+}
+
+function SubTabButton({ active, label, badge, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        padding: '8px 16px', fontSize: 13, fontWeight: 500,
+        border: 'none', background: active ? '#fff' : 'transparent',
+        cursor: 'pointer',
+        borderRadius: 8,
+        color: active ? '#4f46e5' : '#6b7280',
+        boxShadow: active ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
+        transition: 'all 0.15s'
+      }}
+    >
+      {label}
+      {badge !== undefined && (
+        <span style={{
+          marginLeft: 6, padding: '1px 6px',
+          background: active ? '#e0e7ff' : '#e5e7eb',
+          borderRadius: 999, fontSize: 11,
+          color: active ? '#4f46e5' : '#6b7280'
         }}>{badge}</span>
       )}
     </button>
